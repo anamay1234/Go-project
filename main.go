@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,27 +17,34 @@ type Job struct {
 	Status string `json:"status"`
 }
 
-// --- 2. Shared State ---
+// --- 2. Shared State (Now Thread-Safe!) ---
 
-// SharedJobStore wraps our raw map into a dedicated object.
-// We are explicitly setting this up to introduce a Mutex later.
 type SharedJobStore struct {
+	mu   sync.Mutex     // <--- OUR MUTEX!
 	data map[string]Job
 }
 
-// Set is a "method" on the SharedJobStore struct.
-// It saves a job to the map.
 func (s *SharedJobStore) Set(job Job) {
+	// 1. Grab the lock. If another goroutine has it, wait here.
+	s.mu.Lock()
+	
+	// 2. We are now guaranteed to be the only goroutine touching the data.
 	s.data[job.ID] = job
+	
+	// 3. Release the lock for the next goroutine.
+	s.mu.Unlock()
 }
 
-// Get retrieves a job from the map.
 func (s *SharedJobStore) Get(id string) (Job, bool) {
+	s.mu.Lock()
+	// Using `defer` tells Go: "Make sure to run Unlock() the very moment 
+	// this function finishes, no matter how it exits." This is best practice.
+	defer s.mu.Unlock()
+
 	job, exists := s.data[id]
 	return job, exists
 }
 
-// We initialize our global store using the new struct.
 var store = SharedJobStore{
 	data: make(map[string]Job),
 }
@@ -50,7 +58,6 @@ func worker(workerID int) {
 	for job := range jobQueue {
 		fmt.Printf("[Worker %d] Started processing job %s\n", workerID, job.ID)
 
-		// Update via our new SharedJobStore method
 		job.Status = "PROCESSING"
 		store.Set(job)
 
@@ -67,7 +74,7 @@ func worker(workerID int) {
 
 func jobsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
-		jobCounter++
+		jobCounter++ // Note: In a real production app, this counter needs a lock too!
 		newID := fmt.Sprintf("%d", jobCounter)
 
 		newJob := Job{
@@ -101,7 +108,6 @@ func jobStatusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read via our new SharedJobStore method
 	job, exists := store.Get(id)
 	if !exists {
 		http.Error(w, "Job not found", http.StatusNotFound)
