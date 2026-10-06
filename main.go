@@ -13,8 +13,9 @@ import (
 // --- 1. Data Structures ---
 
 type Job struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
+	ID      string `json:"id"`
+	Status  string `json:"status"`
+	Attempt int    `json:"attempt"` // <-- Added to track which attempt this is
 }
 
 // --- 2. Shared State (Thread-Safe) ---
@@ -48,34 +49,38 @@ var jobQueue = make(chan Job, 100)
 
 func worker(workerID int) {
 	for job := range jobQueue {
-		// --- CANCELLATION CHECK 1 ---
-		// The job might have been sitting in the queue for a while.
-		// Let's fetch the most recent status from our store.
 		latestJob, _ := store.Get(job.ID)
 		if latestJob.Status == "CANCELLED" {
 			fmt.Printf("[Worker %d] Skipping cancelled job %s\n", workerID, job.ID)
-			continue // Skip processing!
+			continue
 		}
 
-		fmt.Printf("[Worker %d] Started processing job %s\n", workerID, job.ID)
+		// Save the attempt number we are currently working on
+		currentAttempt := latestJob.Attempt
+
+		fmt.Printf("[Worker %d] Started processing job %s (Attempt %d)\n", workerID, job.ID, currentAttempt)
 		
 		latestJob.Status = "PROCESSING"
 		store.Set(latestJob)
 
-		// Simulate hard work
 		time.Sleep(5 * time.Second)
 
-		// --- CANCELLATION CHECK 2 ---
-		// Did the user cancel it while we were working on it?
+		// Did the user cancel it while we were working?
 		latestJob, _ = store.Get(job.ID)
 		if latestJob.Status == "CANCELLED" {
 			fmt.Printf("[Worker %d] Stopped processing cancelled job %s\n", workerID, job.ID)
 			continue
 		}
 
+		// MAGIC FIX: Did someone hit retry while we were sleeping, causing a newer attempt?
+		if latestJob.Attempt > currentAttempt {
+			fmt.Printf("[Worker %d] Bailing out! A newer attempt (%d) is running for job %s\n", workerID, latestJob.Attempt, job.ID)
+			continue
+		}
+
 		latestJob.Status = "COMPLETED"
 		store.Set(latestJob)
-		fmt.Printf("[Worker %d] Finished processing job %s\n", workerID, job.ID)
+		fmt.Printf("[Worker %d] Finished processing job %s (Attempt %d)\n", workerID, job.ID, currentAttempt)
 	}
 }
 
@@ -91,8 +96,9 @@ func createJobHandler(w http.ResponseWriter, r *http.Request) {
 	newID := fmt.Sprintf("%d", jobCounter)
 
 	newJob := Job{
-		ID:     newID,
-		Status: "PENDING",
+		ID:      newID,
+		Status:  "PENDING",
+		Attempt: 1, // First attempt!
 	}
 
 	store.Set(newJob)
@@ -105,10 +111,9 @@ func createJobHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(newJob)
 }
 
-// jobActionRouter handles /jobs/{id}, /jobs/{id}/cancel, and /jobs/{id}/retry
 func jobActionRouter(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/jobs/")
-	parts := strings.Split(path, "/") // Splitting "/jobs/1/cancel" into ["1", "cancel"]
+	parts := strings.Split(path, "/")
 
 	id := parts[0]
 	if id == "" {
@@ -124,13 +129,11 @@ func jobActionRouter(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// 1. GET /jobs/{id} - Check Status
 	if len(parts) == 1 && r.Method == http.MethodGet {
 		json.NewEncoder(w).Encode(job)
 		return
 	}
 
-	// 2. POST /jobs/{id}/cancel - Cancel a job
 	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
 		if job.Status == "PENDING" || job.Status == "PROCESSING" {
 			job.Status = "CANCELLED"
@@ -140,13 +143,11 @@ func jobActionRouter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. POST /jobs/{id}/retry - Retry a cancelled or failed job
 	if len(parts) == 2 && parts[1] == "retry" && r.Method == http.MethodPost {
 		if job.Status == "CANCELLED" || job.Status == "FAILED" {
 			job.Status = "PENDING"
+			job.Attempt++ // Increase the attempt number!
 			store.Set(job)
-			
-			// Push it back to the queue!
 			jobQueue <- job
 		}
 		json.NewEncoder(w).Encode(job)
